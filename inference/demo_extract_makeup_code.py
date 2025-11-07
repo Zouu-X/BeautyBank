@@ -1,4 +1,8 @@
+import sys
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+
 import argparse
 from types import SimpleNamespace
 
@@ -79,7 +83,7 @@ def build_transform():
 
 def extract_makeup_latent(img_path, save_path, device):
     # Fixed pretrained model path (as requested)
-    ckpt_path = os.path.join('checkpoint', 'encoder.pt')
+    ckpt_path = "/db-mnt/mnt/efs-mount/home/xiangzou/beauty_bank/encoder.pt"
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Pretrained encoder not found at: {ckpt_path}")
 
