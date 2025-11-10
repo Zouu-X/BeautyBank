@@ -14,8 +14,11 @@ import argparse
 import tqdm
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data', required=True)
-parser.add_argument('--output_path', required=True)
+# Input/output args (support aliases for convenience)
+parser.add_argument('--data', '--input', dest='data', required=True, help='Path to input images directory')
+parser.add_argument('--output_path', '--output', dest='output_path', required=True, help='Directory to write results')
+# Pretrained model/checkpoint path
+parser.add_argument('--model', '--checkpoint', '--cp', dest='cp', required=True, help='Path to pretrained model .pth file')
 args = parser.parse_args()
 
 def process_eyes(eyes_uint8, face):
@@ -77,8 +80,9 @@ def vis_parsing_maps(im, parsing_anno, stride, save_im=False, save_path='vis_res
 
     # Save result or not
     if save_im:
-        im_name = save_path[:-4].split('/')[-1]
-        vis_path = f'{args.output_path}/vis/'
+        im_name = os.path.splitext(os.path.basename(save_path))[0]
+        base_dir = os.path.dirname(save_path)
+        vis_path = os.path.join(base_dir, 'vis') + '/'
         os.makedirs(vis_path, exist_ok=True)
 
         skin = (vis_parsing_anno == 1)[..., None]
@@ -186,6 +190,7 @@ def evaluate(respth='./res/test_res', dspth='./data', cp='model_final_diss.pth')
 
 
 if __name__ == "__main__":
-    evaluate(dspth=args.data, cp=os.path.join(f'{os.path.abspath(os.path.dirname(__file__))}/res/cp', '79999_iter.pth'))
-
+    # Output directory is now respected via evaluate's 'respth'.
+    # Checkpoint is fully user-specified via --model/--checkpoint/--cp
+    evaluate(respth=args.output_path, dspth=args.data, cp=args.cp)
 
