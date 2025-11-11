@@ -3,7 +3,6 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
-import os
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
@@ -48,12 +47,7 @@ class TrainOptions():
         self.parser.add_argument("--lr", type=float, default=0.002, help="learning rate")
         self.parser.add_argument("--channel_multiplier", type=int, default=2, help="channel multiplier factor for the model. config-f = 2, else = 1")
         self.parser.add_argument("--wandb", action="store_true", help="use weights and biases logging")
-        # Distributed training
-        self.parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training (also honors LOCAL_RANK env)")
-        # Data loading performance
-        self.parser.add_argument("--workers", type=int, default=8, help="DataLoader workers per process")
-        self.parser.add_argument("--prefetch_factor", type=int, default=2, help="DataLoader prefetch factor (workers > 0)")
-        self.parser.add_argument("--pin_memory", action="store_true", help="Use pinned memory for DataLoader")
+        self.parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
         self.parser.add_argument("--augment", action="store_true", help="apply non leaking augmentation")
         self.parser.add_argument("--augment_p", type=float, default=0, help="probability of applying augmentation. 0 = use adaptive augmentation")
         self.parser.add_argument("--ada_target", type=float, default=0.6, help="target augmentation probability for adaptive augmentation")
@@ -285,13 +279,6 @@ if __name__ == "__main__":
     if not os.path.exists("%s/%s/"%(args.model_path, args.style)):
         os.makedirs("%s/%s/"%(args.model_path, args.style))    
     
-    # Prefer torchrun-style env vars when present
-    if "LOCAL_RANK" in os.environ:
-        try:
-            args.local_rank = int(os.environ["LOCAL_RANK"])  # torchrun sets this
-        except Exception:
-            pass
-
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1
 
@@ -299,12 +286,6 @@ if __name__ == "__main__":
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
-
-    # Enable cuDNN benchmark for faster convolutions on fixed-size inputs
-    try:
-        torch.backends.cudnn.benchmark = True
-    except Exception:
-        pass
 
     args.latent = 512
     args.n_mlp = 8
@@ -382,18 +363,12 @@ if __name__ == "__main__":
     )
 
     dataset = MultiResolutionDataset(args.path, transform, args.size)
-    loader_kwargs = dict(
+    loader = data.DataLoader(
+        dataset,
         batch_size=args.batch,
         sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
-        num_workers=args.workers,
-        pin_memory=args.pin_memory,
-        persistent_workers=True if args.workers and args.workers > 0 else False,
     )
-    if args.workers and args.workers > 0 and args.prefetch_factor and args.prefetch_factor > 0:
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-
-    loader = data.DataLoader(dataset, **loader_kwargs)
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
