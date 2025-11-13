@@ -78,12 +78,27 @@ def noise_normalize_(noises):
         noise.data.add_(-mean).div_(std)
         
 if __name__ == "__main__":
+    # Enable multi-GPU single-node execution via torch.distributed
     device = "cuda"
 
+    # Extend CLI to accept local_rank when launched with torchrun
     parser = TestOptions()
+    # add_argument is safe to call here since TestOptions is local to this file
+    parser.parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)), help="local rank for distributed execution")
     args = parser.parse()
-    print('*'*50)
-      
+
+    # Distributed setup
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", args.local_rank))
+    distributed = world_size > 1
+
+    if distributed:
+        torch.cuda.set_device(args.local_rank)
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+
+    if rank == 0:
+        print('*'*50)
+    
     os.makedirs(f"log/{args.style}/demakeup", exist_ok=True)
 
         
@@ -125,10 +140,14 @@ if __name__ == "__main__":
     percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=device.startswith("cuda"))
     id_loss = id_loss.IDLoss(os.path.join(args.model_path, 'model_ir_se50.pth')).to(device).eval()
 
-    print('Load models successfully!')
+    if rank == 0:
+        print('Load models successfully!')
     
     datapath = os.path.join(args.data_path, args.style, 'images/train')
-    files = os.listdir(datapath) 
+    # Ensure deterministic ordering and shard files across ranks
+    files = sorted(os.listdir(datapath))
+    if distributed:
+        files = [f for idx, f in enumerate(files) if idx % world_size == rank]
     
     bareface_dict = {}
     makeup_dict = {}
@@ -169,7 +188,8 @@ if __name__ == "__main__":
 
         optimizer = optim.Adam([latent] + noises, lr=0.1)
 
-        pbar = tqdm(range(args.iter))
+        # Progress bar only on rank 0 to reduce clutter
+        pbar = tqdm(range(args.iter), disable=(rank != 0))
 
         for i in pbar:
             t = i / args.iter
@@ -203,13 +223,14 @@ if __name__ == "__main__":
 
             noise_normalize_(noises)
 
-            pbar.set_description(
-                (
-                    f"[{ii:03d}/{len(files):03d}]"
-                    f" Lperc: {Lperc.item():.3f}; Lnoise: {Lnoise.item():.3f};"
-                    f" LID: {LID.item():.3f}; Lreg: {Lreg.item():.3f}; lr: {lr:.3f}; l1: {L1_mask.item():.3f}"
+            if rank == 0:
+                pbar.set_description(
+                    (
+                        f"[{ii:03d}/{len(files):03d}]"
+                        f" Lperc: {Lperc.item():.3f}; Lnoise: {Lnoise.item():.3f};"
+                        f" LID: {LID.item():.3f}; Lreg: {Lreg.item():.3f}; lr: {lr:.3f}; l1: {L1_mask.item():.3f}"
+                    )
                 )
-            )
 
         with torch.no_grad():
             latent[:,8:18] = latent_e[:,8:18].detach()   
@@ -232,7 +253,36 @@ if __name__ == "__main__":
                 save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("./log/%s/demakeup/"%(args.style), batchfiles[j]))
                 bareface_dict[batchfiles[j]] = latent_i[j:j+1].cpu().numpy()
     
-    np.save(os.path.join(args.model_path, args.style, 'bareface_code.npy'), bareface_dict)    
-    np.save(os.path.join(args.model_path, args.style, 'makeup_code.npy'), makeup_dict) 
-    print('Demakeup done!')
+    # Save per-rank outputs and optionally merge on rank 0
+    out_dir = os.path.join(args.model_path, args.style)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Save per-rank shards
+    np.save(os.path.join(out_dir, f'bareface_code_rank{rank}.npy'), bareface_dict)
+    np.save(os.path.join(out_dir, f'makeup_code_rank{rank}.npy'), makeup_dict)
+
+    if distributed:
+        torch.distributed.barrier()
+
+    # Merge shards into single npy on rank 0
+    if rank == 0:
+        merged_bare = {}
+        merged_makeup = {}
+        for r in range(world_size):
+            bare_path = os.path.join(out_dir, f'bareface_code_rank{r}.npy')
+            makeup_path = os.path.join(out_dir, f'makeup_code_rank{r}.npy')
+            if os.path.exists(bare_path):
+                part = np.load(bare_path, allow_pickle=True).item()
+                merged_bare.update(part)
+            if os.path.exists(makeup_path):
+                part = np.load(makeup_path, allow_pickle=True).item()
+                merged_makeup.update(part)
+
+        np.save(os.path.join(out_dir, 'bareface_code.npy'), merged_bare)
+        np.save(os.path.join(out_dir, 'makeup_code.npy'), merged_makeup)
+        print('Demakeup done!')
+
+    # Final barrier to ensure rank 0 finished merging before others exit
+    if distributed:
+        torch.distributed.barrier()
     
