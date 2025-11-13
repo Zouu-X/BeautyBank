@@ -96,6 +96,12 @@ if __name__ == "__main__":
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
 
+    # Select explicit device per-rank
+    if torch.cuda.is_available():
+        device = f"cuda:{args.local_rank}"
+    else:
+        device = "cpu"
+
     if rank == 0:
         print('*'*50)
     
@@ -134,10 +140,18 @@ if __name__ == "__main__":
     ckpt = torch.load(model_path, map_location='cpu')
     opts = ckpt['opts']
     opts['checkpoint_path'] = model_path
+    # Ensure encoder latent_avg and internals are created on this rank's device
+    try:
+        current_idx = torch.cuda.current_device() if torch.cuda.is_available() else None
+    except Exception:
+        current_idx = None
+    opts['device'] = f"cuda:{current_idx}" if current_idx is not None else 'cpu'
     opts = Namespace(**opts)
     encoder = pSp(opts).to(device).eval()
 
-    percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=device.startswith("cuda"))
+    # Ensure LPIPS runs on the current rank's GPU (avoid defaulting to GPU 0)
+    gpu_ids = [torch.cuda.current_device()] if torch.cuda.is_available() and device.startswith("cuda") else [0]
+    percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=device.startswith("cuda"), gpu_ids=gpu_ids)
     id_loss = id_loss.IDLoss(os.path.join(args.model_path, 'model_ir_se50.pth')).to(device).eval()
 
     if rank == 0:
