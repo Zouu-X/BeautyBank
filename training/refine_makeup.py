@@ -229,12 +229,12 @@ if __name__ == "__main__":
             Lnoise = noise_regularize(noises)
 
             L1_mask = (torch.abs(img_gen - imgs) * masks).sum() 
-            Lperc_unmasked = percept(img_gen * masks, imgs * masks) 
+            Lperc_unmasked = percept(img_gen * masks, imgs * masks).sum()
             Lperc_masked = Lperc_unmasked
 
-            Lperc_eye_unmasked = percept(img_gen * eye_masks, imgs * eye_masks) 
+            Lperc_eye_unmasked = percept(img_gen * eye_masks, imgs * eye_masks).sum()
             L_eye_masked = Lperc_eye_unmasked 
-            Lperc_mouth_unmasked = percept(img_gen * mouth_masks, imgs * mouth_masks) 
+            Lperc_mouth_unmasked = percept(img_gen * mouth_masks, imgs * mouth_masks).sum()
             L_mouth_masked = Lperc_mouth_unmasked 
 
 
