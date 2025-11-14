@@ -2,16 +2,17 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import argparse
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import optim
-from util import save_image
-import argparse
 from torchvision import transforms
 import torchvision
 from PIL import Image
 from tqdm import tqdm
 
+from util import save_image
 from model.BeautyBank import BeautyBank
 from model.stylegan import lpips
 import model.contextual_loss.functional as FCX
@@ -75,15 +76,38 @@ def noise_normalize_(noises):
         std = noise.std()
 
         noise.data.add_(-mean).div_(std)
-        
+
+
+def init_distributed():
+    if not dist.is_available():
+        return False, 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if "WORLD_SIZE" not in os.environ:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return False, 0, 1, device
+
+    world_size = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    device = torch.device(f"cuda:{local_rank}")
+    return True, rank, world_size, device
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 if __name__ == "__main__":
-    device = "cuda"
+    distributed, rank, world_size, device = init_distributed()
 
     parser = TrainOptions()
     args = parser.parse()
-    print('*'*50)
-    
-        
+    if rank == 0:
+        print('*' * 50)
+
     transform = transforms.Compose(
         [
             transforms.Resize(256),
@@ -103,26 +127,30 @@ if __name__ == "__main__":
     generator = BeautyBank(1024, 512, 8, 2, res_index=6).to(device)
     generator.eval()
 
-    ckpt = torch.load(args.ckpt)
+    ckpt = torch.load(args.ckpt, map_location=device)
     generator.load_state_dict(ckpt["g_ema"])
-    noises_single = generator.make_noise()
+    noises_single = [noise.to(device) for noise in generator.make_noise()]
 
-    percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=device.startswith("cuda"))
+    gpu_ids = [device.index if device.index is not None else 0]
+    percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=device.type == "cuda", gpu_ids=gpu_ids)
     vggloss = VGG19().to(device).eval()
 
-    print('Load models successfully!')
+    if rank == 0:
+        print('Load models successfully!')
     
     datapath = os.path.join(args.data_path, 'images/train')
     makeups_dict = np.load(args.makeup_path, allow_pickle='TRUE').item()
     barefaces_dict = np.load(args.bareface_path, allow_pickle='TRUE').item()
-    files = list(makeups_dict.keys())
+    all_files = list(makeups_dict.keys())
+    files = all_files[rank::world_size]
 
-    print("The number of barefaces you have is : " + str(len(list(barefaces_dict.keys()))))
-    print("The number of makeups you have is : " + str(len(list(makeups_dict.keys()))))
+    if rank == 0:
+        print("The number of barefaces you have is : " + str(len(list(barefaces_dict.keys()))))
+        print("The number of makeups you have is : " + str(len(list(makeups_dict.keys()))))
 
-    dict = {}
-    for ii in range(0,len(files),args.batch):
-        batchfiles = files[ii:ii+args.batch]
+    code_dict = {}
+    for batch_start in range(0, len(files), args.batch):
+        batchfiles = files[batch_start:batch_start+args.batch]
         imgs = []
         makeups = []
         barefaces = []
@@ -175,7 +203,7 @@ if __name__ == "__main__":
                                 {'params':makeups_s,'lr':args.lr_structure}, 
                                 {'params':noises,'lr':0.1}])
 
-        pbar = tqdm(range(args.iter), smoothing=0.01, dynamic_ncols=False, ncols=100)
+        pbar = tqdm(range(args.iter), smoothing=0.01, dynamic_ncols=False, ncols=100, disable=rank != 0)
         
         for i in pbar:       
 
@@ -220,17 +248,18 @@ if __name__ == "__main__":
             optimizer.step()
             noise_normalize_(noises)
 
-            pbar.set_description(
-                (
-                    f"[{ii * args.batch:03d}/{len(files):03d}]"
-                    f" Lp: {Lperc.item():.3f}; Lnoise: {Lnoise.item():.3f};"
-                    f" LCX: {LCX.item():.3f};"
-                    f" L1: {L1_mask.item():.3f};"         
-                    f" Lpm: {Lperc_masked.item():.3f};"  
-                    f" Le: {L_eye_masked.item():.3f};" 
-                    f" Lm: {L_mouth_masked.item():.3f};"         
+            if rank == 0:
+                pbar.set_description(
+                    (
+                        f"[batch {batch_start:03d}/{len(all_files):03d}]"
+                        f" Lp: {Lperc.item():.3f}; Lnoise: {Lnoise.item():.3f};"
+                        f" LCX: {LCX.item():.3f};"
+                        f" L1: {L1_mask.item():.3f};"         
+                        f" Lpm: {Lperc_masked.item():.3f};"  
+                        f" Le: {L_eye_masked.item():.3f};" 
+                        f" Lm: {L_mouth_masked.item():.3f};"         
+                    )
                 )
-            )
 
 
         with torch.no_grad():
@@ -238,9 +267,21 @@ if __name__ == "__main__":
             for j in range(imgs.shape[0]):
                 vis = torchvision.utils.make_grid(torch.cat([imgs[j:j+1], masks[j:j+1], img_gen0[j:j+1], img_gen[j:j+1].detach()], dim=0), 4, 1)
                 save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("/Workspace/Users/xiangxzou@global.tencent.com/BeautyBank/refine_makeup/", batchfiles[j]))
-                dict[batchfiles[j]] = latent[j:j+1].cpu().numpy()
+                code_dict[batchfiles[j]] = latent[j:j+1].cpu().numpy()
 
-    np.save(os.path.join(args.model_path, args.model_name), dict) 
+    if distributed:
+        gathered_dicts = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered_dicts, code_dict)
+        if rank == 0:
+            merged = {}
+            for partial in gathered_dicts:
+                if partial:
+                    merged.update(partial)
+            np.save(os.path.join(args.model_path, args.model_name), merged)
+    else:
+        np.save(os.path.join(args.model_path, args.model_name), code_dict) 
     
-    print('Refinement done!')
-    
+    if rank == 0:
+        print('Refinement done!')
+
+    cleanup_distributed()
