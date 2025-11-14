@@ -83,8 +83,6 @@ if __name__ == "__main__":
     args = parser.parse()
     print('*'*50)
     
-    if not os.path.exists("log/%s/refine_makeup/"%(args.style)):
-        os.makedirs("log/%s/refine_makeup/"%(args.style))
         
     transform = transforms.Compose(
         [
@@ -114,7 +112,7 @@ if __name__ == "__main__":
 
     print('Load models successfully!')
     
-    datapath = os.path.join(args.data_path, args.style, 'images/train')
+    datapath = os.path.join(args.data_path, 'images/train')
     makeups_dict = np.load(args.makeup_path, allow_pickle='TRUE').item()
     barefaces_dict = np.load(args.bareface_path, allow_pickle='TRUE').item()
     files = list(makeups_dict.keys())
@@ -140,13 +138,13 @@ if __name__ == "__main__":
             barefaces.append(torch.tensor(barefaces_dict[file]))
 
             #mask
-            mask = mask_transform(Image.open(os.path.join('./data/makeup/masks/vis/face', file)).convert("RGB"))
+            mask = mask_transform(Image.open(os.path.join('/Workspace/Users/xiangxzou@global.tencent.com/BeautyBank/BMS_subset/masks/train/face', file)).convert("RGB"))
             masks.append(mask)
 
-            eye_mask = mask_transform(Image.open(os.path.join('./data/makeup/masks/vis/combined_eyes', file)).convert("RGB"))
+            eye_mask = mask_transform(Image.open(os.path.join('/Workspace/Users/xiangxzou@global.tencent.com/BeautyBank/BMS_subset/masks/train/combined_eyes', file)).convert("RGB"))
             eye_masks.append(eye_mask)
 
-            mouth_mask = mask_transform(Image.open(os.path.join('./data/makeup/masks/vis/mouth', file)).convert("RGB"))
+            mouth_mask = mask_transform(Image.open(os.path.join('/Workspace/Users/xiangxzou@global.tencent.com/BeautyBank/BMS_subset/masks/train/mouth', file)).convert("RGB"))
             mouth_masks.append(mouth_mask)
 
 
@@ -239,10 +237,10 @@ if __name__ == "__main__":
             latent = torch.cat((makeups_s, makeups_c), dim=1)
             for j in range(imgs.shape[0]):
                 vis = torchvision.utils.make_grid(torch.cat([imgs[j:j+1], masks[j:j+1], img_gen0[j:j+1], img_gen[j:j+1].detach()], dim=0), 4, 1)
-                save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("./log/%s/refine_makeup/"%(args.style), batchfiles[j]))
+                save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("/Workspace/Users/xiangxzou@global.tencent.com/BeautyBank/refine_makeup/", batchfiles[j]))
                 dict[batchfiles[j]] = latent[j:j+1].cpu().numpy()
 
-    np.save(os.path.join(args.model_path, args.style, args.model_name), dict) 
+    np.save(os.path.join(args.model_path, args.model_name), dict) 
     
     print('Refinement done!')
     
