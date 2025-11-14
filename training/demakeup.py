@@ -127,7 +127,9 @@ if __name__ == "__main__":
 
     print('Load models successfully!')
     
-    datapath = os.path.join(args.data_path, args.style, 'images/train')
+    # datapath = os.path.join(args.data_path, args.style, 'images/train')
+    ###INFER USE ONLY
+    datapath = os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example")
     files = os.listdir(datapath) 
     
     bareface_dict = {}
@@ -145,7 +147,7 @@ if __name__ == "__main__":
             imgs.append(img)
 
             #mask
-            mask = mask_transform(Image.open(os.path.join('./data/makeup/masks/vis/face', file)).convert("RGB"))
+            mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_mask/face', file)).convert("RGB"))
             masks.append(mask)
 
         imgs = torch.stack(imgs, 0).to(device)
@@ -229,10 +231,10 @@ if __name__ == "__main__":
                 vis = torchvision.utils.make_grid(torch.cat([imgs[j:j+1], img_rec[j:j+1].detach(), 
                                              img_dsty[j:j+1].detach()], dim=0), 3, 1)
 
-                save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("./log/%s/demakeup/"%(args.style), batchfiles[j]))
+                save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_log", batchfiles[j]))
                 bareface_dict[batchfiles[j]] = latent_i[j:j+1].cpu().numpy()
     
-    np.save(os.path.join(args.model_path, args.style, 'bareface_code.npy'), bareface_dict)    
-    np.save(os.path.join(args.model_path, args.style, 'makeup_code.npy'), makeup_dict) 
+    np.save(os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_log", 'bareface_code.npy'), bareface_dict)    
+    np.save(os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_log", 'makeup_code.npy'), makeup_dict) 
     print('Demakeup done!')
     

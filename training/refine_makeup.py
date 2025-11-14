@@ -138,7 +138,9 @@ if __name__ == "__main__":
     if rank == 0:
         print('Load models successfully!')
     
-    datapath = os.path.join(args.data_path, 'images/train')
+    # datapath = os.path.join(args.data_path, 'images/train')
+    #INFER
+    datapath = os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example")
     makeups_dict = np.load(args.makeup_path, allow_pickle='TRUE').item()
     barefaces_dict = np.load(args.bareface_path, allow_pickle='TRUE').item()
     all_files = list(makeups_dict.keys())
@@ -166,13 +168,13 @@ if __name__ == "__main__":
             barefaces.append(torch.tensor(barefaces_dict[file]))
 
             #mask
-            mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank/BMS_subset/masks/train/face', file)).convert("RGB"))
+            mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_mask/face', file)).convert("RGB"))
             masks.append(mask)
 
-            eye_mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank/BMS_subset/masks/train/combined_eyes', file)).convert("RGB"))
+            eye_mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_mask/combined_eyes', file)).convert("RGB"))
             eye_masks.append(eye_mask)
 
-            mouth_mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank/BMS_subset/masks/train/mouth', file)).convert("RGB"))
+            mouth_mask = mask_transform(Image.open(os.path.join('/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_mask/mouth', file)).convert("RGB"))
             mouth_masks.append(mouth_mask)
 
 
@@ -266,7 +268,7 @@ if __name__ == "__main__":
             latent = torch.cat((makeups_s, makeups_c), dim=1)
             for j in range(imgs.shape[0]):
                 vis = torchvision.utils.make_grid(torch.cat([imgs[j:j+1], masks[j:j+1], img_gen0[j:j+1], img_gen[j:j+1].detach()], dim=0), 4, 1)
-                save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank/refine_makeup/", batchfiles[j]))
+                save_image(torch.clamp(vis.cpu(),-1,1), os.path.join("/db-mnt/mnt/efs-mount/home/xiangxzou/beauty_bank_infer/example_log", batchfiles[j]))
                 code_dict[batchfiles[j]] = latent[j:j+1].cpu().numpy()
 
     if distributed:
@@ -277,9 +279,9 @@ if __name__ == "__main__":
             for partial in gathered_dicts:
                 if partial:
                     merged.update(partial)
-            np.save(os.path.join(args.model_path, args.model_name), merged)
+            np.save(os.path.join(args.data_path, args.model_name), merged)
     else:
-        np.save(os.path.join(args.model_path, args.model_name), code_dict) 
+        np.save(os.path.join(args.data_path, args.model_name), code_dict) 
     
     if rank == 0:
         print('Refinement done!')
