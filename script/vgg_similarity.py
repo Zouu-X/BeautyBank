@@ -17,12 +17,13 @@ embedding vector for the requested facial area.
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -86,6 +87,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip an image when the paired mask cannot be located.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Number of image/mask pairs processed per GPU batch.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of worker processes for the data loader.",
+    )
     return parser.parse_args()
 
 
@@ -132,7 +145,8 @@ def preprocess_pair(
     resize: int,
     center_crop: int,
     mask_threshold: float,
-) -> (torch.Tensor, torch.Tensor):
+    add_batch_dim: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     image = Image.open(image_path).convert("RGB")
     mask = Image.open(mask_path).convert("L")
 
@@ -149,10 +163,13 @@ def preprocess_pair(
     img_tensor = transforms.Normalize(
         mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)
     )(img_tensor)
-    img_tensor = img_tensor.unsqueeze(0)
+    if add_batch_dim:
+        img_tensor = img_tensor.unsqueeze(0)
 
     mask_np = np.array(mask, dtype=np.float32) / 255.0
-    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)
+    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0)
+    if add_batch_dim:
+        mask_tensor = mask_tensor.unsqueeze(0)
     mask_tensor = (mask_tensor >= mask_threshold).float()
 
     return img_tensor, mask_tensor
@@ -173,6 +190,70 @@ def masked_global_pool(
     return normalized
 
 
+def assemble_pairs(
+    images: Sequence[Path],
+    image_root: Path,
+    mask_root: Path,
+    mask_lookup: Dict[str, Path],
+    skip_missing: bool,
+) -> List[Tuple[Path, Path]]:
+    pairs: List[Tuple[Path, Path]] = []
+    for image_path in images:
+        mask_path = resolve_mask_path(image_path, image_root, mask_root, mask_lookup)
+        if mask_path is None:
+            message = f"Mask for {image_path.name} is missing."
+            if skip_missing:
+                logging.warning(message)
+                continue
+            raise FileNotFoundError(message)
+        pairs.append((image_path, mask_path))
+
+    if not pairs:
+        raise RuntimeError("No valid image/mask pairs found.")
+
+    return pairs
+
+
+class FaceRegionDataset(Dataset):
+    def __init__(
+        self,
+        pairs: Sequence[Tuple[Path, Path]],
+        resize: int,
+        center_crop: int,
+        mask_threshold: float,
+    ) -> None:
+        self.pairs = list(pairs)
+        self.resize = resize
+        self.center_crop = center_crop
+        self.mask_threshold = mask_threshold
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        image_path, mask_path = self.pairs[idx]
+        image_tensor, mask_tensor = preprocess_pair(
+            image_path,
+            mask_path,
+            self.resize,
+            self.center_crop,
+            self.mask_threshold,
+            add_batch_dim=False,
+        )
+        return {
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "stem": image_path.stem,
+        }
+
+
+def collate_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    images = torch.stack([item["image"] for item in batch], dim=0)
+    masks = torch.stack([item["mask"] for item in batch], dim=0)
+    stems = [item["stem"] for item in batch]
+    return {"image": images, "mask": masks, "stem": stems}
+
+
 def main() -> None:
     args = parse_args()
     image_root = Path(args.image_dir)
@@ -186,7 +267,13 @@ def main() -> None:
     if device.type != "cuda":
         raise RuntimeError("A CUDA-enabled GPU is required for VGG feature extraction.")
 
-    vgg = VGG19().to(device).eval()
+    vgg_model = VGG19().to(device).eval()
+    gpu_count = torch.cuda.device_count()
+    if gpu_count > 1:
+        logging.info("Using %d GPUs via DataParallel.", gpu_count)
+        vgg = torch.nn.DataParallel(vgg_model)
+    else:
+        vgg = vgg_model
 
     images = list_images(image_root)
     if not images:
@@ -195,31 +282,42 @@ def main() -> None:
     mask_lookup = build_mask_lookup(mask_root)
     layer_index = LAYER_MAP[args.layer]
 
-    logging.info("Processing %d images with layer %s.", len(images), args.layer)
+    pairs = assemble_pairs(
+        images, image_root, mask_root, mask_lookup, args.skip_missing_mask
+    )
+    dataset = FaceRegionDataset(
+        pairs, args.resize, args.center_crop, args.mask_threshold
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_batch,
+    )
 
-    for image_path in tqdm(images, desc="Extracting embeddings"):
-        mask_path = resolve_mask_path(image_path, image_root, mask_root, mask_lookup)
-        if mask_path is None:
-            message = f"Mask for {image_path.name} is missing."
-            if args.skip_missing_mask:
-                logging.warning(message)
-                continue
-            raise FileNotFoundError(message)
+    logging.info(
+        "Processing %d image/mask pairs using layer %s (batch size %d).",
+        len(dataset),
+        args.layer,
+        args.batch_size,
+    )
 
-        image_tensor, mask_tensor = preprocess_pair(
-            image_path, mask_path, args.resize, args.center_crop, args.mask_threshold
-        )
-
-        image_tensor = image_tensor.to(device)
-        mask_tensor = mask_tensor.to(device)
+    for batch in tqdm(dataloader, desc="Extracting embeddings"):
+        image_tensor = batch["image"].to(device, non_blocking=True)
+        mask_tensor = batch["mask"].to(device, non_blocking=True)
+        stems = batch["stem"]
 
         with torch.no_grad():
             feature_maps = vgg(image_tensor)
             feature_map = feature_maps[layer_index]
-            embedding = masked_global_pool(feature_map, mask_tensor)
+            embeddings = masked_global_pool(feature_map, mask_tensor)
 
-        embedding_path = output_root / f"{image_path.stem}.npy"
-        np.save(embedding_path, embedding.squeeze(0).cpu().numpy())
+        embeddings = embeddings.cpu().numpy()
+        for stem, embedding in zip(stems, embeddings):
+            embedding_path = output_root / f"{stem}.npy"
+            np.save(embedding_path, embedding)
 
 
 if __name__ == "__main__":
