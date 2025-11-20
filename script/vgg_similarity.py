@@ -13,6 +13,9 @@ Pipeline
 Each processed sample produces a `.npy` file that stores the L2 normalized
 embedding vector for the requested facial area.
 """
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
 import logging
