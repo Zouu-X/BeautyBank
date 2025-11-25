@@ -34,6 +34,7 @@ from model.vgg_face import VGGFace
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 LAYER_MAP = {
+    "conv1_1": "conv1_1",
     "conv3_3": "conv3_3",
     "conv4_3": "conv4_3",
 }

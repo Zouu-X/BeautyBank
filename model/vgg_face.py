@@ -62,7 +62,9 @@ class VGGFace(nn.Module):
         outputs = {}
         for i, layer in enumerate(self.features):
             x = layer(x)
-            if i == 15: # relu3_3
+            if i == 1: # relu1_1
+                outputs['conv1_1'] = x
+            elif i == 15: # relu3_3
                 outputs['conv3_3'] = x
             elif i == 22: # relu4_3
                 outputs['conv4_3'] = x
