@@ -164,7 +164,7 @@ def preprocess_pair(
 
     img_tensor = transforms.ToTensor()(image)
     img_tensor = transforms.Normalize(
-        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)
+        mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
     )(img_tensor)
     if add_batch_dim:
         img_tensor = img_tensor.unsqueeze(0)
