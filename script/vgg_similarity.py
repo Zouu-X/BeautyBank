@@ -178,97 +178,18 @@ def preprocess_pair(
     return img_tensor, mask_tensor
 
 
-def regional_grid_pool(
+def masked_global_pool(
     feature_map: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Perform regional grid pooling (2x2) on the feature map within the mask's bounding box.
-    
-    Args:
-        feature_map: (N, C, H, W) tensor.
-        mask: (N, 1, H_orig, W_orig) tensor.
-        
-    Returns:
-        (N, 4*C) L2-normalized embedding tensor.
-    """
-    # 1. Resize mask to match feature map spatial dims
     resized_mask = F.interpolate(mask, size=feature_map.shape[-2:], mode="nearest")
-    # resized_mask: (N, 1, H, W)
-    
-    N, C, H, W = feature_map.shape
-    output_embeddings = []
-    
-    for i in range(N):
-        # Get mask for this sample
-        m = resized_mask[i, 0] # (H, W)
-        
-        # Find bounding box
-        nonzero_indices = torch.nonzero(m > 0.5)
-        
-        if nonzero_indices.size(0) == 0:
-            # Empty mask case: return zero vector
-            output_embeddings.append(torch.zeros(4 * C, device=feature_map.device))
-            continue
-            
-        y_min = torch.min(nonzero_indices[:, 0]).item()
-        y_max = torch.max(nonzero_indices[:, 0]).item()
-        x_min = torch.min(nonzero_indices[:, 1]).item()
-        x_max = torch.max(nonzero_indices[:, 1]).item()
-        
-        # Bounding box dimensions
-        h_box = y_max - y_min + 1
-        w_box = x_max - x_min + 1
-        
-        # Split into 2x2 grid
-        y_mid = int(y_min + h_box / 2)
-        x_mid = int(x_min + w_box / 2)
-        
-        # Define 4 regions: (y_start, y_end, x_start, x_end)
-        # We use standard python slicing [start:end] where end is exclusive
-        grids = [
-            (y_min, y_mid, x_min, x_mid),          # Top-Left
-            (y_min, y_mid, x_mid, x_max + 1),      # Top-Right
-            (y_mid, y_max + 1, x_min, x_mid),      # Bottom-Left
-            (y_mid, y_max + 1, x_mid, x_max + 1)   # Bottom-Right
-        ]
-        
-        grid_embeddings = []
-        for y1, y2, x1, x2 in grids:
-            # Handle empty slices
-            if y2 <= y1 or x2 <= x1:
-                grid_embeddings.append(torch.zeros(C, device=feature_map.device))
-                continue
-                
-            sub_feat = feature_map[i, :, y1:y2, x1:x2] # (C, h_sub, w_sub)
-            sub_mask = m[y1:y2, x1:x2] # (h_sub, w_sub)
-            
-            # Masked Average within the grid
-            # If sub_mask is all zeros (mask doesn't cover this part of bbox), result is 0
-            mask_sum = sub_mask.sum()
-            if mask_sum < 1e-6:
-                grid_embeddings.append(torch.zeros(C, device=feature_map.device))
-            else:
-                # Weighted sum
-                weighted_feat = sub_feat * sub_mask.unsqueeze(0)
-                pooled = weighted_feat.sum(dim=(1, 2)) / mask_sum
-                grid_embeddings.append(pooled)
-                
-        # Concatenate 4 vectors
-        full_embedding = torch.cat(grid_embeddings, dim=0) # (4*C,)
-        output_embeddings.append(full_embedding)
-        
-    # Stack into batch
-    output_tensor = torch.stack(output_embeddings, dim=0) # (N, 4*C)
-    
-    # L2 Normalize
-    normalized = F.normalize(output_tensor, p=2, dim=1)
-    
-    # Handle NaNs
+    mask_area = resized_mask.sum(dim=(2, 3)).clamp(min=1e-6)
+    masked_features = feature_map * resized_mask
+    pooled = masked_features.sum(dim=(2, 3)) / mask_area
+    normalized = F.normalize(pooled, p=2, dim=1)
     if torch.isnan(normalized).any():
         normalized = torch.where(
             torch.isnan(normalized), torch.zeros_like(normalized), normalized
         )
-        
     return normalized
 
 
@@ -394,7 +315,7 @@ def main() -> None:
         with torch.no_grad():
             feature_maps = vgg(image_tensor)
             feature_map = feature_maps[layer_index]
-            embeddings = regional_grid_pool(feature_map, mask_tensor)
+            embeddings = masked_global_pool(feature_map, mask_tensor)
 
         embeddings = embeddings.cpu().numpy()
         for stem, embedding in zip(stems, embeddings):
