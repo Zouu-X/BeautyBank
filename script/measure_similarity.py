@@ -1,45 +1,71 @@
-# VGG similarity optimization
+# VGG similarity optimization with DDP
 import argparse
+import os
 import torch
+import torch.distributed as dist
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
+def setup_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return rank, world_size, local_rank
+    else:
+        print("Not using distributed mode. Run with torchrun for DDP.")
+        return 0, 1, 0
+
 def load_and_search(feature_space_dir, query_path, batch_size=100, top_k=3):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    rank, world_size, local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    
+    if rank == 0:
+        print(f"Using {world_size} processes.")
 
     # Load query
     query_np = np.load(query_path)
     query = torch.from_numpy(query_np).to(device)
     
-    # Ensure query is normalized (it should be from vgg_face_similarity.py, but good to be safe)
+    # Ensure query is normalized
     # query = torch.nn.functional.normalize(query, p=2, dim=0) 
 
-    files = sorted(Path(feature_space_dir).glob("*.npy"))
-    if not files:
-        print("No embedding files found.")
+    all_files = sorted(Path(feature_space_dir).glob("*.npy"))
+    if not all_files:
+        if rank == 0:
+            print("No embedding files found.")
         return
 
-    scores_list = []
-    indices_list = []
+    # Partition files among ranks
+    my_files = all_files[rank::world_size]
+    num_files = len(my_files)
+    
+    if rank == 0:
+        print(f"Total files: {len(all_files)}. Processing {num_files} files per rank (approx).")
+
+    local_scores = []
+    local_filenames = []
     
     # Process in batches
-    num_files = len(files)
-    print(f"Processing {num_files} files in batches of {batch_size}...")
+    # Only show progress bar on rank 0
+    iterator = tqdm(range(0, num_files, batch_size), desc=f"Rank {rank}") if rank == 0 else range(0, num_files, batch_size)
     
-    for i in tqdm(range(0, num_files, batch_size)):
-        batch_files = files[i : i + batch_size]
+    for i in iterator:
+        batch_files = my_files[i : i + batch_size]
         batch_feats = []
-        valid_indices = []
+        batch_names = []
         
-        for j, f in enumerate(batch_files):
+        for f in batch_files:
             try:
                 feat = np.load(f)
                 batch_feats.append(feat)
-                valid_indices.append(i + j)
+                batch_names.append(f.name)
             except Exception as e:
-                print(f"Error loading {f}: {e}")
+                print(f"Rank {rank}: Error loading {f}: {e}")
                 continue
         
         if not batch_feats:
@@ -49,34 +75,50 @@ def load_and_search(feature_space_dir, query_path, batch_size=100, top_k=3):
         batch_tensor = torch.from_numpy(np.stack(batch_feats)).to(device)
         
         # Compute cosine similarity
-        # batch_tensor shape: (B, D), query shape: (D,)
-        # result shape: (B,)
-        batch_scores = torch.mv(batch_tensor, query)
+        batch_scores_tensor = torch.mv(batch_tensor, query)
         
-        scores_list.extend(batch_scores.cpu().tolist())
-        indices_list.extend(valid_indices)
+        local_scores.extend(batch_scores_tensor.cpu().tolist())
+        local_filenames.extend(batch_names)
 
-    # Find top-k
-    scores_np = np.array(scores_list)
-    indices_np = np.array(indices_list)
+    # Find local top-k
+    local_scores_np = np.array(local_scores)
+    local_filenames_np = np.array(local_filenames)
     
-    if len(scores_np) == 0:
-        print("No valid scores computed.")
-        return
+    if len(local_scores_np) > 0:
+        # Get top-k indices locally
+        k = min(top_k, len(local_scores_np))
+        top_k_local_indices = np.argsort(local_scores_np)[-k:][::-1]
+        
+        top_k_scores = local_scores_np[top_k_local_indices].tolist()
+        top_k_names = local_filenames_np[top_k_local_indices].tolist()
+        
+        local_results = list(zip(top_k_names, top_k_scores))
+    else:
+        local_results = []
 
-    # Get top-k indices in the scores array
-    # Note: argsort sorts in ascending order, so we take the last k
-    top_k_local_indices = np.argsort(scores_np)[-top_k:][::-1]
-    
-    print(f"\nTop-{top_k} matches (cosine similarity):")
-    for rank, local_idx in enumerate(top_k_local_indices, start=1):
-        global_idx = indices_np[local_idx]
-        score = scores_np[local_idx]
-        file_name = files[global_idx].name
-        print(f"{rank}. {file_name}: cosine={score:.4f}")
+    # Gather results from all ranks
+    all_results = [None for _ in range(world_size)]
+    dist.all_gather_object(all_results, local_results)
+
+    # Rank 0 merges and prints
+    if rank == 0:
+        # Flatten the list of lists
+        flat_results = [item for sublist in all_results for item in sublist]
+        
+        # Sort by score descending
+        flat_results.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take global top-k
+        global_top_k = flat_results[:top_k]
+        
+        print(f"\nTop-{top_k} matches (cosine similarity):")
+        for r, (name, score) in enumerate(global_top_k, start=1):
+            print(f"{r}. {name}: cosine={score:.4f}")
+
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calculate cosine similarity for VGG embeddings.")
+    parser = argparse.ArgumentParser(description="Calculate cosine similarity for VGG embeddings with DDP.")
     parser.add_argument("--feature_space_dir", type=str, required=True, help="Directory containing .npy embedding files.")
     parser.add_argument("--query_path", type=str, required=True, help="Path to the query .npy file.")
     parser.add_argument("--batch_size", type=int, default=100, help="Batch size for processing.")
