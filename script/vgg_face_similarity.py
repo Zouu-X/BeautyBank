@@ -153,7 +153,7 @@ def preprocess_pair(
     mask_threshold: float,
     add_batch_dim: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    image = Image.open(image_path).convert("RGB")
+    image = Image.open(image_path).convert("L").convert("RGB")
     mask = Image.open(mask_path).convert("L")
 
     if resize and resize > 0:
@@ -209,6 +209,28 @@ def masked_global_pool(
         )
     return normalized
 
+### masked_global_pool替换件，不做池化，直接flatten
+def extract_spatial_features(feature_map: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    # 1. Resize mask to feature map size (N, 1, H, W)
+    resized_mask = F.interpolate(mask, size=feature_map.shape[-2:], mode="nearest")
+    
+    # 2. Apply mask
+    masked_features = feature_map * resized_mask
+    
+    # 3. Normalize locally (Per-pixel normalization, optional but helps with lighting changes)
+    # 这一步可以减少亮度的影响，只关注特征的方向
+    # masked_features = F.normalize(masked_features, p=2, dim=1) 
+    
+    # 4. Flatten spatial dimensions
+    # Output shape: (N, C * H * W)
+    # 注意：这会导致向量维度非常大。如果显存/内存不足，建议只用 conv3_3 或 conv4_3
+    batch_size = feature_map.shape[0]
+    flattened = masked_features.view(batch_size, -1)
+    
+    # 5. Global L2 Normalize (so the dot product is cosine similarity)
+    normalized = F.normalize(flattened, p=2, dim=1)
+    
+    return normalized
 
 def assemble_pairs(
     images: Sequence[Path],
@@ -336,7 +358,12 @@ def main() -> None:
             feature_maps = vgg(image_tensor)
             # feature_maps is a dict
             feature_map = feature_maps[args.layer]
-            embeddings = masked_global_pool(feature_map, mask_tensor)
+            # mu = feature_map.mean(dim=(2, 3), keepdim=True)
+            # std = feature_map.std(dim=(2, 3), keepdim=True) + 1e-6
+    
+            # # 标准化：移除该通道的平均颜色强度，保留相对结构
+            # feature_map_norm = (feature_map - mu) / std
+            embeddings = extract_spatial_features(feature_map, mask_tensor)
 
         embeddings = embeddings.cpu().numpy()
         for stem, embedding in zip(stems, embeddings):
