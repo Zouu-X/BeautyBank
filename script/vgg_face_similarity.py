@@ -25,8 +25,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -105,7 +108,45 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of worker processes for the data loader.",
     )
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Enable distributed data parallel (DDP) execution.",
+    )
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="Local rank for distributed training (set automatically by torchrun).",
+    )
     return parser.parse_args()
+
+
+def setup_distributed(args):
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        args.gpu = int(os.environ["LOCAL_RANK"])
+    elif "SLURM_PROCID" in os.environ:
+        args.rank = int(os.environ["SLURM_PROCID"])
+        args.gpu = args.rank % torch.cuda.device_count()
+    else:
+        print("Not using distributed mode")
+        args.distributed = False
+        return
+
+    args.distributed = True
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = "nccl"
+    print(f"| distributed init (rank {args.rank}): {args.dist_backend}", flush=True)
+    dist.init_process_group(
+        backend=args.dist_backend, init_method="env://", world_size=args.world_size, rank=args.rank
+    )
+    dist.barrier()
+
+
+def is_main_process():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
 def list_images(root: Path) -> List[Path]:
@@ -298,24 +339,41 @@ def collate_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    
+    if args.distributed:
+        setup_distributed(args)
+    
     image_root = Path(args.image_dir)
     mask_root = Path(args.mask_dir)
     output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    
+    # Only create directory on main process
+    if is_main_process():
+        output_root.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    # Suppress logs on non-main processes
+    if args.distributed and not is_main_process():
+        logging.getLogger().setLevel(logging.ERROR)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.distributed:
+        device = torch.device(f"cuda:{args.gpu}")
+
     if device.type != "cuda":
         logging.warning("CUDA not available. Using CPU, which might be slow.")
 
     vgg_model = VGGFace(weights_path=args.weights_path).to(device).eval()
-    gpu_count = torch.cuda.device_count()
-    if gpu_count > 1:
-        logging.info("Using %d GPUs via DataParallel.", gpu_count)
-        vgg = torch.nn.DataParallel(vgg_model)
+    
+    if args.distributed:
+        vgg = DDP(vgg_model, device_ids=[args.gpu])
     else:
-        vgg = vgg_model
+        gpu_count = torch.cuda.device_count()
+        if gpu_count > 1:
+            logging.info("Using %d GPUs via DataParallel.", gpu_count)
+            vgg = torch.nn.DataParallel(vgg_model)
+        else:
+            vgg = vgg_model
 
     images = list_images(image_root)
     if not images:
@@ -333,10 +391,17 @@ def main() -> None:
     dataset = FaceRegionDataset(
         pairs, args.resize, args.center_crop, args.mask_threshold
     )
+    
+    if args.distributed:
+        sampler = DistributedSampler(dataset, shuffle=False)
+    else:
+        sampler = None
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=(sampler is None), # Shuffle only if not using sampler (though here we usually don't shuffle for inference)
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_batch,
@@ -349,7 +414,10 @@ def main() -> None:
         args.batch_size,
     )
 
-    for batch in tqdm(dataloader, desc="Extracting embeddings"):
+    # Only show progress bar on main process
+    iterator = tqdm(dataloader, desc="Extracting embeddings") if is_main_process() else dataloader
+
+    for batch in iterator:
         image_tensor = batch["image"].to(device, non_blocking=True)
         mask_tensor = batch["mask"].to(device, non_blocking=True)
         stems = batch["stem"]
@@ -369,6 +437,9 @@ def main() -> None:
         for stem, embedding in zip(stems, embeddings):
             embedding_path = output_root / f"{stem}.npy"
             np.save(embedding_path, embedding)
+            
+    if args.distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
